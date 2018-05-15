@@ -1,0 +1,1015 @@
+#!/usr/bin/env python
+
+__usage__ = "ozymandius [--options] directory [directory directory ...]"
+__doc__ = "a big ol' plotting and evidence estimation script that depends on a predictable directory structure to discover data"
+__author__ = "reed.essick@ligo.org"
+
+#-------------------------------------------------
+
+import os
+import glob as glob
+import pickle
+import gzip
+
+import numpy as np
+import h5py
+
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+plt.rcParams['text.usetex'] = True
+
+from collections import defaultdict
+
+from optparse import OptionParser
+
+### non-standard dependencies
+from universality import utils
+
+#-------------------------------------------------
+
+gr_params = {
+    'lambda1' : '$\Lambda_1$',
+    'lambda2' : '$\Lambda_2$',
+    'a_spin1' : '$a_1$',
+    'a_spin2' : '$a_2$',
+    'chirpmass' : '$\mathcal{M}$',
+    'q' : '$q$',
+    'm1' : '$m_1$',
+    'm2' : '$m_2$',
+    'chi_eff' : '$\chi_\mathrm{eff}$',
+}
+gr_keys = gr_params.keys()
+
+nl_params = {
+    'log10NLTides_A0' : '$\log_{10} A_0$',
+    'NLTides_F0' : '$f_0$',
+    'NLTides_N0' : '$n_0$',
+    'NLTides_dlogAdm' : '$d\log_{10} A/dm$',
+    'NLTides_dFdm' : '$df/dm$',
+    'NLTides_dNdm' : '$dn/dm$',
+}
+nl_keys = nl_params.keys()
+
+ex_params = {
+    'rightascension' : r'$\alpha$',
+    'declination' : r'$\delta$',
+    'logdistance' : '$\log D_L$',
+    'costheta_jn' : r'$\cos\theta_\mathrm{jn}$',
+}
+ex_keys = ex_params.keys()
+
+mc_params = {
+    'logl' : r'$\log\mathcal{L}$',
+}
+mc_keys = mc_params.keys()
+
+# determine what we'll actually include in the corner plot
+params = dict()
+params.update(gr_params)
+params.update(nl_params)
+params.update(ex_params)
+params.update(mc_params)
+
+gr_has_keys = mc_keys + ex_keys + gr_keys
+nl_has_keys = mc_keys + ex_keys + gr_keys + nl_keys
+
+#all_keys = ex_keys + gr_keys + nl_keys
+all_keys = [
+    'logl',
+    'logdistance',
+    'costheta_jn',
+    'rightascension',
+    'declination',
+    'lambda1',
+    'lambda2',
+    'a_spin1',
+    'a_spin2',
+    'chi_eff',
+    'm1',
+    'm2',
+    'q',
+    'chirpmass',
+    'log10NLTides_A0',
+    'NLTides_F0',
+    'NLTides_N0',
+    'NLTides_dlogAdm',
+    'NLTides_dFdm',
+    'NLTides_dNdm',
+]
+
+columns = [params[key] for key in all_keys]
+
+#------------------------
+
+gr_color = 'r'
+gr_alt_color = 'm'
+
+nl_color = 'b'
+nl_alt_color = 'c'
+
+lnB_color = 'k'
+lnB_alt_color = 'grey'
+
+spin2linestyle = {
+    0.050 : 'solid',
+    0.890 : 'dashed',
+}
+
+spin2color = {
+    0.050 : 'b',
+    0.890 : 'r',
+}
+
+spin2alt_color = {
+    0.050 : 'c',
+    0.890 : 'm',
+}
+
+#------------------------
+
+corner_left = 0.8
+corner_right = 0.2
+corner_top = 0.2
+corner_bottom = 0.8
+
+#-------------------------------------------------
+
+def path2stats(path, num_subsets=50, skip=0):
+    data = dict()
+    ### iterate through files and read in chains with temperatures
+    data[path] = extract(path)
+
+    ### iterate through remaining threads
+    i = 1
+    tmp = path+'.%02d'
+    while os.path.exists(tmp%i):
+        data[tmp%i] = extract(tmp%i)
+        i += 1
+
+    ### estiamte the the expected value for each temperature by importance sampling
+    ### need to record error estimates for each temperature
+    ### do this by sub-dividing the sample into many subsets and estimating the mean for each
+    ### compute variance between the subset estimates, then assume central limit theorem and scale variance for the overall average
+    vals = []
+    for v in data.values():
+        vals += v
+
+    vals.sort(key=lambda l: l['temperature'], reverse=True) ### order from larte temperature to small => small beta to large
+    for d in vals:
+        logl = d['logl']
+        d['mean'], d['var'] = estimate(logl, nsubsets=num_subsets, skip=skip)
+
+    ### estimate lnZ by integrating with respect to temperature
+    ### need to propagate error estiamtes to get error estimate for lnZ
+    beta = np.array([1./d['temperature'] for d in vals]) ### inverse temperatures
+    mean = np.array([d['mean'] for d in vals])         # estimates for <logl>
+    var = np.array([d['var'] for d in vals])
+
+    mean_lnZ, var_lnZ = thermoint(beta, mean, var)
+
+    ### repeat but with half the number of temperatures to estimate systematics
+    beta_half = np.array([beta[0]] + list(beta[1::2]))
+    mean_half = np.array([mean[0]] + list(mean[1::2])) # a subset used to estimate systematics
+    var_half = np.array([var[0]] + list(var[1::2]))
+
+    mean_lnZ_half, var_lnZ_half = thermoint(beta_half, mean_half, var_half)
+
+    ### FIXME:
+    ###    implement more/better systematics checks, like taking random subsets of the temperatures, etc
+    ###    look for convergence/invariance as we increase the number of temperatures
+    ###    may need to do this in a way that isn't just hard coding subsets...
+
+    # record stats
+    data.update({
+        'mean_lnZ':mean_lnZ,
+        'var_lnZ':var_lnZ,
+        'mean_lnZ_half':mean_lnZ_half,
+        'var_lnZ_half':var_lnZ_half,
+    })
+
+    return data
+
+def stats2stacked(datas):
+    N2 = len(datas)
+    m = [d['mean_lnZ'] for d in datas]
+    v = [d['var_lnZ'] for d in datas]
+
+    M = np.mean(m)
+    V = np.var(m) + np.sum(v)/N2 ### sum in quadrature...
+
+    m_half = [d['mean_lnZ_half'] for d in datas]
+    v_half = [d['var_lnZ_half'] for d in datas]
+    M_half = np.mean(m_half)
+    V_half = np.var(m_half) + np.sum(v_half)/N2 ### sum in quadrature
+
+    return {
+        'mean_lnZ':M,
+        'var_lnZ':V,
+        'mean_lnZ_half':M_half,
+        'var_lnZ_half':V_half,
+    }
+
+def thermoint(b, m, v):
+    integral = np.trapz(m, b)
+    var_integral = np.sum((v[1:] + v[:-1])*0.25*(b[1:]-b[:-1])**2) ### sum in quadrature
+    return integral, var_integral
+
+def extract(
+        path,
+        upper=[('log10NLTides_A0',-3), ('H1_spcal_amp_0',10)],
+        lower=[('H1_spcal_amp_0',-10), ('logl', -1e7)],
+    ):
+    data = []
+    with h5py.File(path, 'r') as f:
+        with h5py.File(path+'.resume', 'r') as g: ### read in temperatures
+            for key in f['lalinference/lalinference_mcmc'].keys():
+                samples = f['lalinference/lalinference_mcmc'][key][:]
+
+                # throw away badly behaved samples
+                for field, threshold in upper:
+                    if samples.dtype.fields.has_key(field):
+                        samples = samples[samples[field]<=threshold] ### strip out caustic samples from bugs in LALInf writing to disk
+
+                for field, threshold in lower:
+                    if samples.dtype.fields.has_key(field):
+                        samples = samples[samples[field]>=threshold] ### strip out caustic samples from bugs in LALInf writing to disk
+
+                samples = update(samples) ### add in fields we don't have...
+
+                d = {
+                    'temperature':g['lalinference/lalinference_mcmc'][key+'-checkpoint'].attrs['temperature'], 
+                    'logl':samples['logl'],
+                }
+
+                if d['temperature']==1.:
+                    d['samples'] = samples ### only store samples for the Temp=1 run
+
+                data.append(d)
+
+    return data
+
+def update(samples):
+    '''
+    add in m1, m2, chi_eff if we don't have them
+    '''
+    mc = samples['chirpmass']
+    q = samples['q']
+    a1 = samples['a_spin1']
+    a2 = samples['a_spin2']
+
+    m1 = mc * (1+q)**0.2 / q**0.6
+    m2 = q * m1
+    chi_eff = (m1*a1 + m2*a2)/(m1+m2) ### mass weighted combination of z-components of the spin
+
+    dtype = samples.dtype.descr + [('m1','float'), ('m2','float'), ('chi_eff','float')]
+    data = [samples[x] for x in [_[0] for _ in samples.dtype.descr]]+[m1, m2, chi_eff]
+
+    return np.array(zip(*data), dtype=dtype)
+
+def estimate(samples, nsubsets=20, skip=None):
+    '''
+    estimate mean and uncertainty on the mean using a bootstrapping proceedure
+    '''
+    if (skip is None):
+        skip = len(samples)/2 ### throw out the first half of the samples by default...
+
+    elif skip >= len(samples): ### FIXME: come up with a better way to strip burn in?
+        print('\n--------------------------\n\nWARNING: cannot skip more samples than are included in the original list\n\n--------------------------\n')
+        skip = len(samples)/2
+
+    samples = samples[skip:] ### skip the first few samples
+
+    if len(samples)<nsubsets:
+        print('\n--------------------------\n\nWARNING: reducing the number of subsets to the number of samples\n\n--------------------------\n')
+        nsubsets = len(samples)
+
+    # estimate mean using all samples
+    mean = np.mean(samples)
+
+    # partition samples into subsets of roughly equal size to estiamte variance
+    samples = list(samples)
+
+    sums = np.zeros(nsubsets, dtype='float')
+    counts = np.zeros(nsubsets, dtype='int')
+
+    i = 0
+    while len(samples):
+        sums[i] += samples.pop(np.random.randint(0, len(samples)))
+        counts[i] += 1
+        i = (i+1)%nsubsets
+
+    var = np.var(sums/counts)/nsubsets ### scale the variances of the means from each subset to get the variance for the overall mean
+
+    return mean, var
+
+#------------------------
+
+def gps2fig(modeldict, bandwidth=0.1, num_points=101, outlier_stdv=2, verbose=False):
+
+    Ncol = len(all_keys)
+    figwidth = corner_left+corner_right+1.1*Ncol
+    figheight = corner_bottom+corner_top+1.1*Ncol
+    fig = plt.figure(figsize=(figwidth, figheight))
+
+    plt.subplots_adjust(
+        hspace=0.1,
+        wspace=0.1,
+        left=corner_left/figwidth,
+        right=(figwidth-corner_right)/figwidth,
+        bottom=corner_bottom/figheight,
+        top=(figheight-corner_top)/figheight,
+    )
+
+    ### extract GR samples
+    gr = [np.array([])]*Ncol
+    for path, _ in modeldict['GR']['separate'].items():
+        temps = [d['temperature'] for d in _[path]]
+        samples = _[path][temps.index(1.0)]['samples']
+        for i, key in enumerate(all_keys):
+            if key in gr_has_keys:
+                concat = samples[key]
+            else:
+                concat = [np.nan]*len(samples)
+            gr[i] = np.concatenate((gr[i], concat))
+    gr = np.array(gr).transpose()
+    gr, gr_means, gr_stds = utils.iqr_whiten(gr, verbose=verbose)
+
+    ### extract NL samples
+    nl = [np.array([])]*Ncol
+    for path, _ in modeldict['NL']['separate'].items():
+        temps = [d['temperature'] for d in _[path]]
+        samples = _[path][temps.index(1.0)]['samples']
+        for i, key in enumerate(all_keys):
+            if key in nl_has_keys:
+                concat = samples[key]
+            else:
+                concat = [np.nan]*len(samples)
+            nl[i] = np.concatenate((nl[i], concat))
+
+    nl = np.array(nl).transpose()
+    nl, nl_means, nl_stds = utils.iqr_whiten(nl, verbose=verbose)
+
+    ### set-up data for KDE iteration
+    # NOTE: we limit the possible ranges by multiples of the standard deviation (in whitened data)
+    max_dev = 3
+    gr_bounds = np.array([np.array([max(-max_dev, np.min(gr[:,i])), min(max_dev, np.max(gr[:,i]))]) for i in xrange(Ncol)])
+    gr_vects = np.array([np.linspace(bound[0], bound[1], num_points) for bound in gr_bounds])
+
+    nl_bounds = np.array([np.array([max(-max_dev, np.min(nl[:,i])), min(max_dev, np.max(nl[:,i]))]) for i in xrange(Ncol)])
+    nl_vects = np.array([np.linspace(bound[0], bound[1], num_points) for bound in nl_bounds])
+
+    gr_N = len(gr)
+    gr_Nbins = max(10, int(gr_N**0.5)/2)
+
+    nl_N = len(nl)
+    nl_Nbins = max(10, int(nl_N**0.5)/2)
+
+    v = np.ones(Ncol, dtype='float')*bandwidth**2
+
+    truth =  np.empty(Ncol, dtype=bool) # used to index data within loop
+    shape = (num_points, num_points) # used to reshape 2D sampling kdes
+
+    # iterate through all pairs of columns, generating an axis for both
+    for row in xrange(Ncol):
+        for col in xrange(row+1): ### only plot the lower-left triangle
+            ax = plt.subplot(Ncol, Ncol, row*Ncol+col+1)
+
+            if verbose:
+                print('working on\n    row : %s\n    col = %s'%(all_keys[row], all_keys[col]))
+
+            truth[:] = False
+
+            # actually plot
+            if row==col:
+                # marginalized KDE
+                truth[col] = True
+
+                if all_keys[col] in gr_has_keys:
+                    kde = utils.logkde(gr_vects[col], gr[:,truth], v[col])
+                    kde = np.exp(kde-np.max(kde))
+
+                    kde /= np.sum(kde)*gr_stds[col]*(gr_vects[col][1]-gr_vects[col][0]) # normalize kde to match what a histogram would yield
+                    ax.plot(gr_means[col]+gr_stds[col]*gr_vects[col], kde, color=gr_color)
+
+                    ax.hist(gr_means[col]+gr_stds[col]*gr[:,col], bins=np.linspace(*(gr_means[col]+gr_stds[col]*gr_bounds[col]), num=gr_Nbins), histtype='step', color=gr_alt_color, linestyle='dashed', normed=True)
+
+                if all_keys[col] in nl_has_keys:
+                    kde = utils.logkde(nl_vects[col], nl[:,truth], v[col])
+                    kde = np.exp(kde-np.max(kde))
+
+                    kde /= np.sum(kde)*nl_stds[col]*(nl_vects[col][1]-nl_vects[col][0]) # normalize kde to match what a histogram would yield
+                    ax.plot(nl_means[col]+nl_stds[col]*nl_vects[col], kde, color=nl_color)
+
+                    ax.hist(nl_means[col]+nl_stds[col]*nl[:,col], bins=np.linspace(*(nl_means[col]+nl_stds[col]*nl_bounds[col]), num=nl_Nbins), histtype='step', color=nl_alt_color, linestyle='dashed', normed=True)
+
+            else:
+                # marginalized KDE
+                truth[row] = True
+                truth[col] = True
+
+                ylim = None
+
+                yes_gr = (all_keys[row] in gr_has_keys) and (all_keys[col] in gr_has_keys)
+                yes_nl = (all_keys[row] in nl_has_keys) and (all_keys[col] in nl_has_keys)
+
+                if yes_gr:
+                    ax.scatter(gr_means[col]+gr_stds[col]*gr[:,col], gr_means[row]+gr_stds[row]*gr[:,row], marker='.', s=1, alpha=min(1, 500./gr_N), color=gr_color)
+                if yes_nl:
+                    ax.scatter(nl_means[col]+nl_stds[col]*nl[:,col], nl_means[row]+nl_stds[row]*nl[:,row], marker='.', s=1, alpha=min(1, 500./nl_N), color=nl_color)
+
+                if yes_gr:
+                    kde = utils.logkde(np.transpose([_.flatten() for _ in np.meshgrid(gr_vects[col], gr_vects[row], indexing='ij')]), gr[:,truth], v[truth])
+                    kde = np.exp(kde-np.max(kde)).reshape(shape)
+                    kde /= np.sum(kde)*gr_stds[col]*(gr_vects[col][1]-gr_vects[col][0])*gr_stds[row]*(gr_vects[row][1]-gr_vects[row][0]) # normalize kde
+
+                    ax.contour(gr_means[col]+gr_stds[col]*gr_vects[col], gr_means[row]+gr_stds[row]*gr_vects[row], kde.transpose(), colors=gr_color, alpha=0.5)
+
+                    ylim = gr_means[row] + gr_stds[row]*gr_bounds[row]
+
+                if yes_nl:
+                    kde = utils.logkde(np.transpose([_.flatten() for _ in np.meshgrid(nl_vects[col], nl_vects[row], indexing='ij')]), nl[:,truth], v[truth])
+                    kde = np.exp(kde-np.max(kde)).reshape(shape)
+                    kde /= np.sum(kde)*nl_stds[col]*(nl_vects[col][1]-nl_vects[col][0])*nl_stds[row]*(nl_vects[row][1]-nl_vects[row][0]) # normalize kde
+
+                    ax.contour(nl_means[col]+nl_stds[col]*nl_vects[col], nl_means[row]+nl_stds[row]*nl_vects[row], kde.transpose(), colors=nl_color, alpha=0.5)
+
+                    if ylim is None:
+                        ylim = nl_means[row] + nl_stds[row]*nl_bounds[row]
+
+                    else:
+                        ymin, ymax =  nl_means[row] + nl_stds[row]*nl_bounds[row]
+                        ylim = min(ylim[0], ymin), max(ylim[1], ymax)
+
+                ax.set_ylim(ylim)
+
+            # decorate                
+            if row!=(Ncol-1):
+                plt.setp(ax.get_xticklabels(), visible=False)
+            else:
+                ax.set_xlabel('%s'%columns[col])
+
+            if col!=0 or row==0: #!=0
+                plt.setp(ax.get_yticklabels(), visible=False)
+            else:
+                ax.set_ylabel('%s'%columns[row])
+
+            ax.grid(True, which='both')
+            plt.setp(ax.get_xticklabels(), rotation=45)
+
+            xlim = None
+            if (all_keys[col] in gr_has_keys):
+                xlim = gr_means[col] + gr_stds[col]*gr_bounds[col]
+
+            if (all_keys[col] in nl_has_keys):
+                if xlim is None:
+                    xlim = nl_means[col] + nl_stds[col]*nl_bounds[col]
+
+                else:
+                    xmin, xmax = nl_means[col] + nl_stds[col]*nl_bounds[col]
+                    xlim = min(xlim[0], xmin), max(xlim[1], xmax)
+
+            ax.set_xlim(xlim)
+
+    # further decorate
+    fig.suptitle('$N_\mathrm{GR}=%d$\n$N_\mathrm{NL}=%d$'%(len(gr), len(nl)))
+
+    mlnB = modeldict['NL']['stacked']['mean_lnZ'] - modeldict['GR']['stacked']['mean_lnZ'] ### mean
+    slnB = (modeldict['NL']['stacked']['var_lnZ'] + modeldict['GR']['stacked']['var_lnZ'])**0.5 ### standard deviation (statistical uncertainty)
+    SlnB = abs(mlnB - (modeldict['NL']['stacked']['mean_lnZ_half'] - modeldict['GR']['stacked']['mean_lnZ_half'])) ### basic estimate of systematic uncertainty
+
+    text = '$\log B^\mathrm{NL}_\mathrm{PP} =$ %.4f $\pm$ %.4f $\pm$ %.4f'%(mlnB, slnB, SlnB)
+    if verbose:
+        print(text)
+
+    fig.text(
+        0.75,
+        0.75,
+        text,
+        color='k',
+        ha='center',
+        va='center',
+    )
+
+    return fig
+
+#---
+
+def highlevel2numfig(highlevel, verbose=False):
+    '''
+    plot the number of samples as a function of flow
+
+    NOTE: assumes we only have a single high
+    '''
+    figwidth = 8
+    figheight = 4
+
+    ### re-order by gps time (separate events)
+    gps = defaultdict(dict)
+    for flow, fhigh, spin in highlevel.keys():
+        for t, sub in highlevel[(flow, fhigh, spin)].items():
+            gps[t].update( {(flow, fhigh, spin) : sub} )
+    
+    ### iterate through times, adding a line for each
+    figs = []
+    for t, d in gps.items():
+        fig = plt.figure(figsize=(figwidth, figheight))
+        ax = fig.gca()
+
+        ### split up by spins
+        spins = defaultdict(dict)
+        for flow, fhigh, spin in d.keys():
+            spins[spin].update( {(flow, fhigh):d[(flow,fhigh,spin)]} )
+
+        ### iterate through spins, extracting NL, GR model numbers
+        for spin, D in spins.items():
+            flows = []
+            gr_num = []
+            nl_num = []
+            for (flow, fhigh), modeldict in D.items():
+                flows.append( flow )
+
+                gr = 0.
+                for path, _ in modeldict['GR']['separate'].items():
+                    temps = [d['temperature'] for d in _[path]]
+                    gr += len(_[path][temps.index(1.0)]['samples'])
+                gr_num.append(gr)
+
+                nl = 0.
+                for path, _ in modeldict['NL']['separate'].items():
+                    temps = [d['temperature'] for d in _[path]]
+                    nl += len(_[path][temps.index(1.0)]['samples'])
+                nl_num.append(nl)
+
+            flows = np.array(flows)
+            gr_num = np.array(gr_num)
+            nl_num = np.array(nl_num)
+
+            order = flows.argsort()
+            flows = flows[order]
+            gr_num = gr_num[order]
+            nl_num = nl_num[order]
+
+            ax.semilogy(flows, gr_num, marker='o', color=gr_color, linestyle=spin2linestyle[spin], label='GR $|a|\leq$%.2f'%spin)
+            ax.semilogy(flows, nl_num, marker='o', color=nl_color, linestyle=spin2linestyle[spin], label='NL $|a|\leq$%.2f'%spin)
+
+        ax.set_xlabel('$f_\mathrm{low}\ [\mathrm{Hz}]$')
+        ax.set_ylabel('number of samples')
+
+        ax.grid(True, which='both')
+        ax.legend(loc='best', ncol=2)
+
+        xmin, xmax = ax.get_xlim()
+        dx = 0.02*(xmax-xmin)
+        xmin -= dx
+        xmax += dx
+        ax.set_xlim(xmin=xmin, xmax=xmax)
+
+        fig.suptitle('gps=%.3f'%t)
+
+        plt.subplots_adjust(
+            left=0.08,
+            right=0.98,
+            bottom=0.10,
+            top=0.93,
+        )
+
+        figs.append( (fig, t) )
+
+    return figs
+
+def highlevel2evidencefig(highlevel, verbose=False):
+    '''
+    generate plots of evidence and bayes factors as a function of flow
+
+    NOTE: assumes we only have a single fhigh
+    '''
+    figwidth = 8
+    figheight = 9
+
+    ### re-order by gps time (separate events)
+    gps = defaultdict(dict)
+    for flow, fhigh, spin in highlevel.keys():
+        for t, sub in highlevel[(flow, fhigh, spin)].items():
+            gps[t].update( {(flow, fhigh, spin) : sub} )
+
+    ### iterate through times, adding a line for each
+    figs = []
+    for t, d in gps.items():
+        fig = plt.figure(figsize=(figwidth, figheight))
+
+        ax_nl = plt.subplot(3,1,1)
+        ax_gr = plt.subplot(3,1,2)
+        ax_lnB = plt.subplot(3,1,3)
+
+        ### split up by spins
+        spins = defaultdict(dict)
+        for flow, fhigh, spin in d.keys():
+            spins[spin].update( {(flow, fhigh):d[(flow,fhigh,spin)]} )
+
+        ### iterate through spins, extracting NL, GR model numbers
+        for spin, D in spins.items():
+            flows = []
+
+            gr_lnZ = []
+            gr_slnZ = []
+            gr_SlnZ = []
+
+            nl_lnZ = []
+            nl_slnZ = []
+            nl_SlnZ = []
+
+            lnB = []
+            slnB = []
+            SlnB = []
+
+            for (flow, fhigh), modeldict in D.items():
+                flows.append( flow )
+
+                lnz_gr = modeldict['GR']['stacked']['mean_lnZ']
+                lnz_nl = modeldict['NL']['stacked']['mean_lnZ']
+
+                vlnz_gr = modeldict['GR']['stacked']['var_lnZ']
+                vlnz_nl = modeldict['NL']['stacked']['var_lnZ']
+
+                Slnz_gr = lnz_gr - modeldict['GR']['stacked']['mean_lnZ_half']
+                Slnz_nl = lnz_nl - modeldict['NL']['stacked']['mean_lnZ_half']
+
+                gr_lnZ.append( lnz_gr )
+                gr_slnZ.append( vlnz_gr**0.5 )
+                gr_SlnZ.append( abs(Slnz_gr) )
+
+                nl_lnZ.append( lnz_nl )
+                nl_slnZ.append( vlnz_nl**0.5 )
+                nl_SlnZ.append( abs(Slnz_nl) )
+
+                lnB.append( lnz_nl - lnz_gr )
+                slnB.append( (vlnz_nl + vlnz_gr)**0.5 )
+                SlnB.append( abs(Slnz_nl - Slnz_gr) )
+
+            flows = np.array(flows)
+
+            gr_lnZ = np.array(gr_lnZ)
+            gr_slnZ = np.array(gr_slnZ)
+            gr_SlnZ = np.array(gr_SlnZ)
+
+            nl_lnZ = np.array(nl_lnZ)
+            nl_slnZ = np.array(nl_slnZ)
+            nl_SlnZ = np.array(nl_SlnZ)
+
+            lnB = np.array(lnB)
+            slnB = np.array(slnB)
+            SlnB = np.array(SlnB)
+
+            order = flows.argsort()
+            flows = flows[order]
+
+            gr_lnZ = gr_lnZ[order]
+            gr_slnZ = gr_slnZ[order]
+            gr_SlnZ = gr_SlnZ[order]
+
+            gr_lnZ = gr_lnZ[order]
+            gr_slnZ = gr_slnZ[order]
+            gr_SlnZ = gr_SlnZ[order]
+
+            lnB = lnB[order]
+            slnB = slnB[order]
+            SlnB = SlnB[order]
+
+            ax_nl.fill_between(flows, nl_lnZ-(nl_slnZ+nl_SlnZ), nl_lnZ+(nl_slnZ+nl_SlnZ), color=nl_color, alpha=0.25) ### plot both stat and sys errors
+            ax_nl.fill_between(flows, nl_lnZ-(nl_slnZ), nl_lnZ+(nl_slnZ), color=nl_color, alpha=0.25)                 ### plot only stat errors
+            ax_nl.plot(flows, nl_lnZ, marker='o', color=nl_color, linestyle=spin2linestyle[spin], label='$|a|\leq$%.2f'%spin)      ### plot point estimate
+
+            ax_gr.fill_between(flows, gr_lnZ-(gr_slnZ+gr_SlnZ), gr_lnZ+(gr_slnZ+gr_SlnZ), color=gr_color, alpha=0.25) ### repeat!
+            ax_gr.fill_between(flows, gr_lnZ-(gr_slnZ), gr_lnZ+(gr_slnZ), color=gr_color, alpha=0.25)
+            ax_gr.plot(flows, gr_lnZ, marker='o', color=gr_color, linestyle=spin2linestyle[spin], label='$|a|\leq$%.2f'%spin)
+
+            ax_lnB.fill_between(flows, lnB-(slnB+SlnB), lnB+(slnB+SlnB), color=spin2alt_color[spin], alpha=0.25) ### repeat!
+            ax_lnB.fill_between(flows, lnB-(slnB), lnB+(slnB), color=spin2color[spin], alpha=0.25)
+            ax_lnB.plot(flows, lnB, marker='o', color=spin2color[spin], linestyle=spin2linestyle[spin], label='$|a|\leq$%.2f'%spin)
+
+        plt.setp(ax_nl.get_xticklabels(), visible=False)
+        plt.setp(ax_gr.get_xticklabels(), visible=False)
+        ax_lnB.set_xlabel('$f_\mathrm{low}\ [\mathrm{Hz}]$')
+
+        ax_nl.set_ylabel('$\log Z_\mathrm{NL}$')
+        ax_gr.set_ylabel('$\log Z_\mathrm{PP}$')
+        ax_lnB.set_ylabel('$\log B^\mathrm{NL}_\mathrm{PP}$')
+
+        ax_nl.grid(True, which='both')
+        ax_gr.grid(True, which='both')
+        ax_lnB.grid(True, which='both')
+
+        ax_nl.legend(loc='best', ncol=2)
+        ax_gr.legend(loc='best', ncol=2)
+        ax_lnB.legend(loc='best', ncol=2)
+
+        xmin, xmax = ax_lnB.get_xlim()
+        dx = 0.02*(xmax-xmin)
+        xmin -= dx
+        xmax += dx
+        ax_nl.set_xlim(xmin=xmin, xmax=xmax)
+        ax_gr.set_xlim(xmin=xmin, xmax=xmax)
+        ax_lnB.set_xlim(xmin=xmin, xmax=xmax)
+
+        fig.suptitle('gps=%.3f'%t)
+
+        plt.subplots_adjust(
+            hspace = 0.05,
+            left=0.13,
+            right=0.99,
+            bottom=0.05,
+            top=0.96,
+        )
+
+        figs.append( (fig, t) )
+
+    return figs
+
+def highlevel2paramfig(key, highlevel, verbose=False, bandwidth=0.1, num_points=101):
+    '''
+    make violin plots of samples as a function of flow
+
+    NOTE: assumes we only have a single high
+    '''
+    figwidth = 8
+    figheight = 4
+
+    max_dev = 3
+    v = bandwidth**2
+
+    ### re-order by gps time (separate events)
+    gps = defaultdict(dict)
+    for flow, fhigh, spin in highlevel.keys():
+        for t, sub in highlevel[(flow, fhigh, spin)].items():
+            gps[t].update( {(flow, fhigh, spin) : sub} )
+
+    ### iterate through times, adding a line for each
+    figs = []
+    for t, d in gps.items():
+        fig = plt.figure(figsize=(figwidth, figheight))
+        ax = fig.gca()
+
+        ### split up by spins
+        spins = defaultdict(dict)
+        for flow, fhigh, spin in d.keys():
+            spins[spin].update( {(flow, fhigh):d[(flow,fhigh,spin)]} )
+
+        ### iterate through spins, extracting NL, GR model numbers
+        for spin, D in spins.items():
+            first = True
+            for (flow, fhigh), modeldict in D.items():
+                toplot = []
+
+                ### extract GR samples
+                if key in gr_has_keys:
+                    gr = np.array([])
+                    for path, _ in modeldict['GR']['separate'].items():
+                        temps = [d['temperature'] for d in _[path]]
+                        samples = _[path][temps.index(1.0)]['samples']
+                        gr = np.concatenate((gr, samples[key]))
+                    gr, gr_means, gr_stds = utils.iqr_whiten(gr, verbose=verbose)
+
+                    gr_bounds = np.array([max(-max_dev, np.min(gr)), min(max_dev, np.max(gr))])
+                    gr_vects = np.linspace(gr_bounds[0], gr_bounds[1], num_points)
+
+                    kde = utils.logkde(gr_vects, gr, v)
+                    kde = np.exp(kde-np.max(kde))
+                    kde /= np.sum(kde)*gr_stds*(gr_vects[1]-gr_vects[0]) # normalize kde to match what a histogram would yield
+
+                    label = 'GR $|a|\leq$%.2f'%spin if first else None
+                    toplot.append( (kde, gr_means+gr_stds*gr_vects, gr_color, label) )
+
+                ### extract NL samples
+                if key in nl_has_keys:
+                    nl = np.array([])
+                    for path, _ in modeldict['NL']['separate'].items():
+                        temps = [d['temperature'] for d in _[path]]
+                        samples = _[path][temps.index(1.0)]['samples']
+                        nl = np.concatenate((nl, samples[key]))
+                    nl, nl_means, nl_stds = utils.iqr_whiten(nl, verbose=verbose)
+
+                    nl_bounds = np.array([max(-max_dev, np.min(nl)), min(max_dev, np.max(nl))])
+                    nl_vects = np.linspace(nl_bounds[0], nl_bounds[1], num_points)
+
+                    kde = utils.logkde(nl_vects, nl, v)
+                    kde = np.exp(kde-np.max(kde))
+                    kde /= np.sum(kde)*nl_stds*(nl_vects[1]-nl_vects[0]) # normalize kde to match what a histogram would yield
+
+                    label = 'NL $|a|\leq$%.2f'%spin if first else None
+                    toplot.append( (kde, nl_means+nl_stds*nl_vects, nl_color, label) )
+
+                df = 8 / max([np.max(_[0]) for _ in toplot]) ### NOTE: this magic number should scale both KDEs correctly
+
+                if key=='logl': ### NOTE: a special case, we need to muck around with y as well
+                    yref = np.mean([np.median(_[1]) for _ in toplot])
+                    toplot = [(_[0], _[1]-yref, _[2], _[3]) for _ in toplot]
+
+                for x, y, color, label in toplot:
+                    if label:
+                        ax.plot(flow + df*x, y, color=color, linestyle=spin2linestyle[spin], label=label)
+
+                    else:
+                        ax.plot(flow + df*x, y, color=color, linestyle=spin2linestyle[spin])
+
+                first = False
+
+        ax.set_xlabel('$f_\mathrm{low}\ [\mathrm{Hz}]$')
+
+        if key=='logl': ### NOTE: a special case, we need to handle label carefully because we plot something non-standard
+           ax.set_ylabel(r'$\log\mathcal{L} - \left(\log\mathcal{L}\right)_\mathrm{ref}$')
+
+        else:
+            ax.set_ylabel(params[key])
+
+        ax.grid(True, which='both')
+        ax.legend(loc='best', ncol=2)
+
+        xmin, xmax = ax.get_xlim()
+        dx = 0.02*(xmax-xmin)
+        xmin -= dx
+        xmax += dx
+        ax.set_xlim(xmin=xmin, xmax=xmax)
+
+        ymin, ymax = ax.get_ylim()
+        dy = 0.02*(ymax - ymin)
+        ymin -= dy
+        ymax += dy
+        ax.set_ylim(ymin=ymin, ymax=ymax)
+
+        fig.suptitle('gps=%.3f'%t)
+
+        plt.subplots_adjust(
+            left=0.08,
+            right=0.98,
+            bottom=0.10,
+            top=0.93,
+        )
+
+        figs.append( (fig, t) )
+
+    return figs
+
+#-------------------------------------------------
+
+parser = OptionParser(usage=__usage__, description=__doc__)
+
+parser.add_option('-v', '--verbose', default=False, action='store_true')
+parser.add_option('-V', '--Verbose', default=False, action='store_true')
+
+parser.add_option('-b', '--bandwidth', default=0.1, type='float',
+    help='bandwidth for Gaussian KDE. \
+DEFAULT=0.1')
+parser.add_option('-n', '--num-points', default=101, type='float',
+    help='the number of evaluation points used in the KDE. \
+DEFAULT=101')
+
+parser.add_option('', '--skip-corner', default=False, action='store_true',
+    help='do not generate the corner plots, which is one of the more expensive parts of the script')
+parser.add_option('', '--skip-high-level', default=False, action='store_true',
+    help='do not generate the high-level plots')
+
+parser.add_option('-o', '--output-dir', default='.', type='string')
+parser.add_option('-t', '--tag', default='', type='string')
+
+parser.add_option('', '--figtype', default=[], type='string', action='append')
+parser.add_option('', '--dpi', default=200, type='int')
+
+opts, args = parser.parse_args()
+assert len(args), 'please supply at least 1 input argument\n%s'%__usage__
+
+if opts.tag:
+    opts.tag = "_"+opts.tag
+
+if not os.path.exists(opts.output_dir):
+    os.makedirs(opts.output_dir)
+
+if not opts.figtype:
+    opts.figtype.append( 'png' )
+
+opts.verbose |= opts.Verbose
+
+#-------------------------------------------------
+
+highlevel = dict()
+for directory in args:
+    ### parse basic info from directory name
+    if opts.verbose:
+        print('processing: '+directory)
+    basename = os.path.basename(directory.strip('/'))
+    try:
+        flow, fhigh, spin = basename.split('_')
+        flow = int(flow)
+        fhigh = int(fhigh)
+        spin = float(spin.replace('d','.'))
+    except:
+        raise Warning, 'something went wrong parsing basename from: '+directory
+        continue
+
+    ### go forth and discover hdf5 files, sorting them cleverly
+    hdf5 = defaultdict(dict)
+    for model in ['NL', 'GR']:
+        if opts.verbose:
+            print('  discovering hdf5 for model='+model)
+        _hdf5 = defaultdict(list)
+        for path in glob.glob(os.path.join(directory,model,'*/*/engine/*hdf5')):
+            try:
+                gps = float(os.path.basename(path).split('-')[-2])
+            except:
+                raise Warning, 'something went wrong parsing gps from: '+path
+                continue
+            _hdf5[gps].append(path)
+        if not len(_hdf5.keys()):
+            raise Warning, 'no paths associated with this model...'
+            continue
+
+        for gps in _hdf5.keys():
+            hdf5[gps].update({model:_hdf5[gps]})
+
+    ### check discovered data for consistency, "non-null pointers"    
+    for gps in hdf5.keys():
+        if not (hdf5[gps].has_key('NL') and hdf5[gps].has_key('GR')):
+            raise Warning, 'did not find hdf5 for both models for gps=%.3f; removing this gps'%(gps)
+            hdf5.pop(gps)
+
+    if not len(hdf5.keys()):
+        raise Warning, 'no valid gps found'
+        continue
+
+    ### iterate through gps, models with hdf5 files and compute things
+    for gps in hdf5.keys():
+        if opts.verbose:
+            print('  processing gps=%.3f'%gps)
+
+        for model in ['NL', 'GR']:
+            if opts.verbose:
+                print('    processing model='+model)
+
+            stats = dict()
+            for path in sorted(hdf5[gps][model]): ### process these in some sort of ordered way
+                if opts.verbose:
+                    print('      processing: '+path)
+
+                ### compute things for this hdf5 alone
+                stats[path] = path2stats(path)
+            
+            ### stack things for this model
+            if opts.verbose:
+                print('    stacking results for model='+model)
+            stacked = stats2stacked(stats.values())
+
+            # record everything you just computed
+            hdf5[gps][model] = {'stacked':stacked, 'separate':stats}
+
+        ### plot things for this gps
+        if not opts.skip_corner:
+            if opts.verbose:
+                print('  plotting gps=%.3f'%gps)
+            fig = gps2fig(hdf5[gps], bandwidth=opts.bandwidth, num_points=opts.num_points, verbose=opts.Verbose)
+
+            for figtype in opts.figtype:
+                figname = '%s/ozymandius-corner-%d-%d-%02d-%d%s.%s'%(opts.output_dir, flow, fhigh, int(spin*100), int(gps), opts.tag, figtype)
+                if opts.verbose:
+                    print('  saving '+figname)
+                fig.savefig(figname, dpi=opts.dpi)
+            plt.close(fig)
+
+    ### record the results in highlevel for later use
+    highlevel[(flow, fhigh, spin)] = hdf5
+
+### plot the high-level stuff
+if not opts.skip_high_level:
+    if opts.verbose:
+        print('plotting high-level results\nnumber of samples')
+
+    for fig, gps in highlevel2numfig(highlevel, verbose=opts.Verbose):
+        for figtype in opts.figtype:
+            figname = '%s/ozymandius-num-%d%s.%s'%(opts.output_dir, int(gps), opts.tag, figtype)
+            if opts.verbose:
+                print('saving '+figname)
+            fig.savefig(figname)
+        plt.close(fig)
+
+    for fig, gps in highlevel2evidencefig(highlevel, verbose=opts.Verbose):
+        for figtype in opts.figtype:
+            figname = '%s/ozymandius-evidence-%d%s.%s'%(opts.output_dir, int(gps), opts.tag, figtype)
+            if opts.verbose:
+                print('saving '+figname)
+            fig.savefig(figname)
+        plt.close(fig)
+       
+    for key in all_keys:
+        for fig, gps in highlevel2paramfig(key, highlevel, bandwidth=opts.bandwidth, num_points=opts.num_points, verbose=opts.Verbose):
+            for figtype in opts.figtype:
+                figname = '%s/ozymandius-%s-%d%s.%s'%(opts.output_dir, key, int(gps), opts.tag, figtype)
+                if opts.verbose:
+                    print('saving '+figname)
+                fig.savefig(figname)
+            plt.close(fig)
+
+### saving data
+#pklname = figname.replace('png','pkl')
+#if opts.verbose:
+#    print('saving '+pklname)
+#with gzip.open(pklname, 'w') as file_obj:
+#    pickle.dump(highlevel, file_obj)
