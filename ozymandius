@@ -135,10 +135,13 @@ corner_bottom = 0.8
 
 #-------------------------------------------------
 
-def path2stats(path, num_subsets=50, skip=0):
+def path2stats(path, num_subsets=50, skip=0, skip_evidence=False):
     data = dict()
     ### iterate through files and read in chains with temperatures
     data[path] = extract(path)
+
+    if skip_evidence:
+        return data
 
     ### iterate through remaining threads
     i = 1
@@ -305,7 +308,7 @@ def estimate(samples, nsubsets=20, skip=None):
 
 #------------------------
 
-def gps2fig(modeldict, bandwidth=0.1, num_points=101, outlier_stdv=2, verbose=False):
+def gps2fig(modeldict, bandwidth=0.1, num_points=101, outlier_stdv=2, verbose=False, skip_evidence=False):
 
     Ncol = len(all_keys)
     figwidth = corner_left+corner_right+1.1*Ncol
@@ -474,22 +477,23 @@ def gps2fig(modeldict, bandwidth=0.1, num_points=101, outlier_stdv=2, verbose=Fa
     # further decorate
     fig.suptitle('$N_\mathrm{GR}=%d$\n$N_\mathrm{NL}=%d$'%(len(gr), len(nl)))
 
-    mlnB = modeldict['NL']['stacked']['mean_lnZ'] - modeldict['GR']['stacked']['mean_lnZ'] ### mean
-    slnB = (modeldict['NL']['stacked']['var_lnZ'] + modeldict['GR']['stacked']['var_lnZ'])**0.5 ### standard deviation (statistical uncertainty)
-    SlnB = abs(mlnB - (modeldict['NL']['stacked']['mean_lnZ_half'] - modeldict['GR']['stacked']['mean_lnZ_half'])) ### basic estimate of systematic uncertainty
+    if not skip_evidence:
+        mlnB = modeldict['NL']['stacked']['mean_lnZ'] - modeldict['GR']['stacked']['mean_lnZ'] ### mean
+        slnB = (modeldict['NL']['stacked']['var_lnZ'] + modeldict['GR']['stacked']['var_lnZ'])**0.5 ### standard deviation (statistical uncertainty)
+        SlnB = abs(mlnB - (modeldict['NL']['stacked']['mean_lnZ_half'] - modeldict['GR']['stacked']['mean_lnZ_half'])) ### basic estimate of systematic uncertainty
 
-    text = '$\log B^\mathrm{NL}_\mathrm{PP} =$ %.4f $\pm$ %.4f $\pm$ %.4f'%(mlnB, slnB, SlnB)
-    if verbose:
-        print(text)
+        text = '$\log B^\mathrm{NL}_\mathrm{PP} =$ %.4f $\pm$ %.4f $\pm$ %.4f'%(mlnB, slnB, SlnB)
+        if verbose:
+            print(text)
 
-    fig.text(
-        0.75,
-        0.75,
-        text,
-        color='k',
-        ha='center',
-        va='center',
-    )
+        fig.text(
+            0.75,
+            0.75,
+            text,
+            color='k',
+            ha='center',
+            va='center',
+        )
 
     return fig
 
@@ -868,6 +872,8 @@ parser.add_option('', '--skip-corner', default=False, action='store_true',
     help='do not generate the corner plots, which is one of the more expensive parts of the script')
 parser.add_option('', '--skip-high-level', default=False, action='store_true',
     help='do not generate the high-level plots')
+parser.add_option('', '--skip-evidence', default=False, action='store_true',
+    help='only load in posterior samples and make a kde.')
 
 parser.add_option('-o', '--output-dir', default='.', type='string')
 parser.add_option('-t', '--tag', default='', type='string')
@@ -951,21 +957,26 @@ for directory in args:
                     print('      processing: '+path)
 
                 ### compute things for this hdf5 alone
-                stats[path] = path2stats(path)
+                stats[path] = path2stats(path, skip_evidence=opts.skip_evidence)
             
             ### stack things for this model
-            if opts.verbose:
-                print('    stacking results for model='+model)
-            stacked = stats2stacked(stats.values())
+            if not opts.skip_evidence:
+                if opts.verbose:
+                    print('    stacking results for model='+model)
+                stacked = stats2stacked(stats.values())
+            
+                # record everything you just computed
+                hdf5[gps][model] = {'stacked':stacked, 'separate':stats}
 
-            # record everything you just computed
-            hdf5[gps][model] = {'stacked':stacked, 'separate':stats}
+            else:
+                # record everything you just computed
+                hdf5[gps][model] = {'separate':stats}
 
         ### plot things for this gps
         if not opts.skip_corner:
             if opts.verbose:
                 print('  plotting gps=%.3f'%gps)
-            fig = gps2fig(hdf5[gps], bandwidth=opts.bandwidth, num_points=opts.num_points, verbose=opts.Verbose)
+            fig = gps2fig(hdf5[gps], bandwidth=opts.bandwidth, num_points=opts.num_points, verbose=opts.Verbose, skip_evidence=opts.skip_evidence)
 
             for figtype in opts.figtype:
                 figname = '%s/ozymandius-corner-%d-%d-%02d-%d%s.%s'%(opts.output_dir, flow, fhigh, int(spin*100), int(gps), opts.tag, figtype)
@@ -990,13 +1001,14 @@ if not opts.skip_high_level:
             fig.savefig(figname)
         plt.close(fig)
 
-    for fig, gps in highlevel2evidencefig(highlevel, verbose=opts.Verbose):
-        for figtype in opts.figtype:
-            figname = '%s/ozymandius-evidence-%d%s.%s'%(opts.output_dir, int(gps), opts.tag, figtype)
-            if opts.verbose:
-                print('saving '+figname)
-            fig.savefig(figname)
-        plt.close(fig)
+    if not opts.skip_evidence:
+        for fig, gps in highlevel2evidencefig(highlevel, verbose=opts.Verbose):
+            for figtype in opts.figtype:
+                figname = '%s/ozymandius-evidence-%d%s.%s'%(opts.output_dir, int(gps), opts.tag, figtype)
+                if opts.verbose:
+                    print('saving '+figname)
+                fig.savefig(figname)
+            plt.close(fig)
        
     for key in all_keys:
         for fig, gps in highlevel2paramfig(key, highlevel, bandwidth=opts.bandwidth, num_points=opts.num_points, verbose=opts.Verbose):
