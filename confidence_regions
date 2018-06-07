@@ -51,7 +51,7 @@ for upper in opts.upper:
     print('%s <= %.6e @ %.6e confidence'%(opts.field, np.percentile(samples, upper), upper))
 
 for lower in opts.lower:
-    lower *= 100
+    lower = (1-lower)*100 ### set this up so we have the correct value for np.percentile
     print('%s >= %.6e @ %.6e confidence'%(opts.field, np.percentile(samples, lower), lower))
 
 ### generate confidence regions
