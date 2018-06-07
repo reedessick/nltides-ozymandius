@@ -1,0 +1,61 @@
+#!/usr/bin/env python
+
+__usage__ = "dissipation_limits [--options] samples.hdf5 [samples.hdf5 samples.hdf5 ...]"
+__doc__ = "an executable that computes things"
+__author__ = "reed.essick@ligo.org"
+
+#-------------------------------------------------
+
+import os
+import numpy as np
+
+from optparse import OptionParser
+
+### non-standard libraries
+from sddr import utils
+
+#-------------------------------------------------
+
+parser = OptionParser(usage=__usage__, description=__doc__)
+
+parser.add_option('-v', '--verbose', default=False, action='store_true')
+parser.add_option('-V', '--Verbose', default=False, action='store_true')
+
+parser.add_option('', '--initial-burnin', default=utils.DEFAULT_INITIAL_BURNIN, type='int',
+    help='force the code to skip the first --initial-burnin samples, and then proceed with --deltaLogP logic. \
+DEFAULT=%d'%utils.DEFAULT_INITIAL_BURNIN)
+parser.add_option('', '--deltaLogP', default=utils.DEFAULT_DELTALOGP, type='float',
+    help='used when stripping burn-in from hdf5 files')
+parser.add_option('', '--downsample', default=utils.DEFAULT_DOWNSAMPLE, type='int',
+    help='only retain 1 out of every --downsample samples after stripping burn-in. Used when reading both file types')
+
+parser.add_option('', '--upper', default=[], type='float', action='append',
+    help='confidence levels for upper limits. e.g.: `--upper 0.9`. Can be repeated')
+parser.add_option('', '--lower', default=[], type='float', action='append',
+    help='confidence levels for lower limits. e.g.: `--lower 0.9`. Can be repeated')
+parser.add_option('', '--greedy', default=[], type='float', action='append',
+    help='confidence levels for greedy binned confidence regions. e.g.: `--greedy 0.9`. Can be repeated')
+
+parser.add_option('-o', '--output-dir', default='.', type='string')
+parser.add_option('-t', '--tag', default='', type='string')
+
+opts, args = parser.parse_args()
+assert args, 'please supply at least 1 input argument\n%s'%__usage__
+
+opts.verbose |= opts.Verbose
+
+if not os.path.exists(opts.output_dir):
+    os.makedirs(opts.output_dir)
+
+if opts.tag:
+    opts.tag = "_"+opts.tag
+
+#-------------------------------------------------
+
+### read in samples for all parameters
+samples = utils.load(args, field=None, deltaLogP=opts.deltaLogP, downsample=opts.downsample, initial_burnin=opts.initial_burnin, verbose=opts.verbose)
+
+#-------------------------------------------------
+
+### generate limits
+raise NotImplementedError('need to compute energy dissipated as a function of frequency and total energy dissipated for each sample. Add these to bins/etc and then report to disk. Use a separate plotting script to make plots')
